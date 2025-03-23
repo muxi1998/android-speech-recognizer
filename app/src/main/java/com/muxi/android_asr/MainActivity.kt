@@ -187,9 +187,12 @@ class MainActivity : ComponentActivity() {
                     partialText.value = ""
                 }
                 
-                // After getting results, continue listening for the next phrase
-                // This is not auto-restart - it's part of the same session
-                // It will still stop after 5 seconds of silence
+                // The recognizer has stopped after getting results
+                // Update UI state to reflect this
+                isListening.value = false
+                
+                // Note: To continue listening after getting results, you would need to 
+                // call startListening() again but without clearing the text
             }
             
             override fun onPartialResults(partialResults: Bundle?) {
