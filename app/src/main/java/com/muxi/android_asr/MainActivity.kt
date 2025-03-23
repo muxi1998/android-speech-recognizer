@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -45,18 +47,16 @@ class MainActivity : ComponentActivity() {
     private val TAG = "SpeechRecognizer"
     private lateinit var speechRecognizer: SpeechRecognizer
     private var recognizedText = mutableStateOf("")
-    private var partialText = mutableStateOf("")
     private var isListening = mutableStateOf(false)
     private var selectedLanguage = mutableStateOf("en-US") // Default to English
-    private var lastStartTime = 0L
-    private var lastErrors = mutableListOf<Int>()
-    private var waitingForSpeech = false
+    private val handler = Handler(Looper.getMainLooper())
+    private var restartRunnable: Runnable? = null
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         if (isGranted) {
-            startSpeechRecognition()
+            startListening()
         } else {
             Toast.makeText(this, "Microphone permission is required", Toast.LENGTH_SHORT).show()
         }
@@ -74,25 +74,15 @@ class MainActivity : ComponentActivity() {
             Android_asrTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     SpeechRecognizerScreen(
-                        recognizedText = if (recognizedText.value.isEmpty()) {
-                            partialText.value
-                        } else if (partialText.value.isEmpty()) {
-                            recognizedText.value
-                        } else {
-                            "${recognizedText.value} ${partialText.value}"
-                        },
+                        recognizedText = recognizedText.value,
                         isListening = isListening.value,
                         selectedLanguage = selectedLanguage.value,
                         onLanguageSelected = { 
                             selectedLanguage.value = it
-                            Log.d(TAG, "Language selected: $it") 
                         },
-                        onStartListening = { checkPermissionAndStartRecognition() },
-                        onStopListening = { stopSpeechRecognition() },
-                        onClearText = { 
-                            recognizedText.value = ""
-                            partialText.value = ""
-                        },
+                        onStartListening = { checkPermission() },
+                        onStopListening = { stopListening() },
+                        onClearText = { recognizedText.value = "" },
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
@@ -108,75 +98,31 @@ class MainActivity : ComponentActivity() {
             
             override fun onBeginningOfSpeech() {
                 Log.d(TAG, "onBeginningOfSpeech")
-                waitingForSpeech = false // User has started speaking
             }
             
-            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onRmsChanged(rmsdB: Float) {
+                // Intentionally empty
+            }
             
             override fun onBufferReceived(buffer: ByteArray?) {
-                Log.d(TAG, "onBufferReceived")
+                // Intentionally empty
             }
             
             override fun onEndOfSpeech() {
                 Log.d(TAG, "onEndOfSpeech")
-                // Natural end of speech - will be followed by onResults
-                // We do NOT stop listening here - user must press stop
+                
+                // If we're still in listening mode, schedule a restart
+                if (isListening.value) {
+                    scheduleRestart()
+                }
             }
             
             override fun onError(error: Int) {
                 Log.e(TAG, "onError: $error")
                 
-                // Special handling for ERROR_NO_MATCH when no speech has been detected yet
-                if (error == SpeechRecognizer.ERROR_NO_MATCH && waitingForSpeech) {
-                    Log.d(TAG, "Ignoring initial NO_MATCH and restarting recognition")
-                    
-                    // Keep track of consecutive errors to prevent infinite loops
-                    lastErrors.add(error)
-                    if (lastErrors.size > 3) {
-                        lastErrors.removeAt(0)
-                    }
-                    
-                    // Only if we're still actively listening and this isn't a recurring pattern
-                    if (isListening.value && !lastErrors.all { it == SpeechRecognizer.ERROR_NO_MATCH }) {
-                        try {
-                            // Restart listening without changing UI state
-                            speechRecognizer.startListening(createRecognizerIntent())
-                            return
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Failed to restart after NO_MATCH: ${e.message}")
-                        }
-                    }
-                }
-                
-                // Save any partial results we have, regardless of error
-                if (partialText.value.isNotEmpty()) {
-                    if (recognizedText.value.isEmpty()) {
-                        recognizedText.value = partialText.value
-                    } else {
-                        recognizedText.value += " " + partialText.value
-                    }
-                    partialText.value = ""
-                }
-                
-                // Update UI to show recognition has stopped
-                waitingForSpeech = false
-                isListening.value = false
-                
-                // Only show toast for errors other than NO_MATCH (which is too common)
-                if (error != SpeechRecognizer.ERROR_NO_MATCH) {
-                    val errorMessage = when (error) {
-                        SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
-                        SpeechRecognizer.ERROR_CLIENT -> "Client side error"
-                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions"
-                        SpeechRecognizer.ERROR_NETWORK -> "Network error"
-                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
-                        SpeechRecognizer.ERROR_NO_MATCH -> "No recognition result matched"
-                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognition service busy"
-                        SpeechRecognizer.ERROR_SERVER -> "Server error"
-                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input"
-                        else -> "Unknown error"
-                    }
-                    Toast.makeText(applicationContext, errorMessage, Toast.LENGTH_SHORT).show()
+                // For errors, if we're still supposed to be listening, restart
+                if (isListening.value) {
+                    scheduleRestart()
                 }
             }
             
@@ -186,45 +132,63 @@ class MainActivity : ComponentActivity() {
                 
                 if (!matches.isNullOrEmpty()) {
                     val result = matches[0]
-                    Log.d(TAG, "Result: $result")
-                    
-                    // Append to existing recognized text
+                    // Append to recognized text with a space
                     if (recognizedText.value.isEmpty()) {
                         recognizedText.value = result
                     } else {
-                        // Add a space between existing text and new result
-                        recognizedText.value += " " + result
+                        recognizedText.value += " $result"
                     }
-                    partialText.value = ""
                 }
                 
-                // SpeechRecognizer stops after delivering results
-                // Update UI to reflect this
-                isListening.value = false
+                // If we're still in listening mode, restart immediately
+                if (isListening.value) {
+                    scheduleRestart()
+                }
             }
             
             override fun onPartialResults(partialResults: Bundle?) {
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 if (!matches.isNullOrEmpty()) {
-                    // Store only the current partial phrase
-                    partialText.value = matches[0]
-                    Log.d(TAG, "Partial: ${partialText.value}")
+                    val newPartial = matches[0]
+                    
+                    // Optionally update UI with partial results
+                    // Uncomment to show partial results in real-time
+                    // Note: This might make the text jumpy as it updates frequently
+                    // recognizedText.value = if (recognizedText.value.isEmpty()) newPartial else "${recognizedText.value} $newPartial"
                 }
             }
             
             override fun onEvent(eventType: Int, params: Bundle?) {
-                Log.d(TAG, "onEvent: $eventType")
+                // Intentionally empty
             }
         })
     }
     
-    private fun checkPermissionAndStartRecognition() {
+    private fun checkPermission() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) 
             == PackageManager.PERMISSION_GRANTED) {
-            startSpeechRecognition()
+            startListening()
         } else {
             requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
+    }
+    
+    private fun scheduleRestart() {
+        // Cancel any pending restarts
+        cancelPendingRestarts()
+        
+        // Schedule a new restart with a small delay
+        restartRunnable = Runnable {
+            if (isListening.value) {
+                startSpeechRecognizer()
+            }
+        }
+        handler.postDelayed(restartRunnable!!, 100)
+    }
+    
+    private fun cancelPendingRestarts() {
+        restartRunnable?.let { handler.removeCallbacks(it) }
+        restartRunnable = null
     }
     
     private fun createRecognizerIntent(): Intent {
@@ -237,62 +201,44 @@ class MainActivity : ComponentActivity() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, selectedLanguage.value)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, selectedLanguage.value)
             
-            // For English, also specify locale
-            if (selectedLanguage.value == "en-US") {
-                putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, true)
-            }
-            
-            // Don't use any timeouts - let the user take as long as needed to start speaking
-            // These are max values to prevent the recognizer from timing out
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 0)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000000) // Very long
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000000) // Very long
+            // Only specify "prefer offline" - let the system handle timeouts
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
             
             // Multiple results for better accuracy
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
         }
     }
     
-    private fun startSpeechRecognition() {
-        // Reset text when starting fresh
-        recognizedText.value = ""
-        partialText.value = ""
+    private fun startListening() {
+        // Only reset text when starting fresh (not restarting)
+        if (!isListening.value) {
+            recognizedText.value = ""
+        }
+        
         isListening.value = true
-        lastStartTime = System.currentTimeMillis()
-        waitingForSpeech = true
-        lastErrors.clear()
-        
-        val recognizerIntent = createRecognizerIntent()
-        
+        startSpeechRecognizer()
+    }
+    
+    private fun startSpeechRecognizer() {
         try {
-            speechRecognizer.startListening(recognizerIntent)
+            speechRecognizer.startListening(createRecognizerIntent())
             Log.d(TAG, "Started listening with language: ${selectedLanguage.value}")
         } catch (e: Exception) {
-            isListening.value = false
-            waitingForSpeech = false
             Log.e(TAG, "Error starting recognition: ${e.message}")
-            Toast.makeText(this, "Error starting recognition: ${e.message}", Toast.LENGTH_SHORT).show()
+            scheduleRestart() // Try again if there was an error
         }
     }
     
-    private fun stopSpeechRecognition() {
-        // When manually stopping, save any partial results
-        if (partialText.value.isNotEmpty()) {
-            if (recognizedText.value.isEmpty()) {
-                recognizedText.value = partialText.value
-            } else {
-                recognizedText.value += " " + partialText.value
-            }
-            partialText.value = ""
-        }
-        
-        speechRecognizer.stopListening()
+    private fun stopListening() {
         isListening.value = false
+        cancelPendingRestarts()
+        speechRecognizer.stopListening()
         Log.d(TAG, "Stopped listening")
     }
     
     override fun onDestroy() {
         super.onDestroy()
+        cancelPendingRestarts()
         speechRecognizer.destroy()
     }
 }
