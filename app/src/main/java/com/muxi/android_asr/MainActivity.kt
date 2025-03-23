@@ -48,6 +48,9 @@ class MainActivity : ComponentActivity() {
     private var partialText = mutableStateOf("")
     private var isListening = mutableStateOf(false)
     private var selectedLanguage = mutableStateOf("en-US") // Default to English
+    private var lastStartTime = 0L
+    private var lastErrors = mutableListOf<Int>()
+    private var waitingForSpeech = false
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -105,6 +108,7 @@ class MainActivity : ComponentActivity() {
             
             override fun onBeginningOfSpeech() {
                 Log.d(TAG, "onBeginningOfSpeech")
+                waitingForSpeech = false // User has started speaking
             }
             
             override fun onRmsChanged(rmsdB: Float) {}
@@ -116,43 +120,50 @@ class MainActivity : ComponentActivity() {
             override fun onEndOfSpeech() {
                 Log.d(TAG, "onEndOfSpeech")
                 // Natural end of speech - will be followed by onResults
+                // We do NOT stop listening here - user must press stop
             }
             
             override fun onError(error: Int) {
                 Log.e(TAG, "onError: $error")
                 
-                // For speech timeout errors, consider it as completion
-                if (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-                    // Save any partial results
-                    if (partialText.value.isNotEmpty()) {
-                        if (recognizedText.value.isEmpty()) {
-                            recognizedText.value = partialText.value
-                        } else {
-                            recognizedText.value += " " + partialText.value
-                        }
-                        partialText.value = ""
+                // Special handling for ERROR_NO_MATCH when no speech has been detected yet
+                if (error == SpeechRecognizer.ERROR_NO_MATCH && waitingForSpeech) {
+                    Log.d(TAG, "Ignoring initial NO_MATCH and restarting recognition")
+                    
+                    // Keep track of consecutive errors to prevent infinite loops
+                    lastErrors.add(error)
+                    if (lastErrors.size > 3) {
+                        lastErrors.removeAt(0)
                     }
                     
-                    // End listening on 5 seconds of silence
-                    Log.d(TAG, "Stopping due to 5 seconds of silence")
-                    isListening.value = false
-                } else if (error == SpeechRecognizer.ERROR_NO_MATCH) {
-                    // For no match errors, save any partial results
-                    if (partialText.value.isNotEmpty()) {
-                        if (recognizedText.value.isEmpty()) {
-                            recognizedText.value = partialText.value
-                        } else {
-                            recognizedText.value += " " + partialText.value
+                    // Only if we're still actively listening and this isn't a recurring pattern
+                    if (isListening.value && !lastErrors.all { it == SpeechRecognizer.ERROR_NO_MATCH }) {
+                        try {
+                            // Restart listening without changing UI state
+                            speechRecognizer.startListening(createRecognizerIntent())
+                            return
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to restart after NO_MATCH: ${e.message}")
                         }
-                        partialText.value = ""
                     }
-                    
-                    // Keep listening for no match errors
-                    return
-                } else {
-                    // For all other errors
-                    isListening.value = false
-                    
+                }
+                
+                // Save any partial results we have, regardless of error
+                if (partialText.value.isNotEmpty()) {
+                    if (recognizedText.value.isEmpty()) {
+                        recognizedText.value = partialText.value
+                    } else {
+                        recognizedText.value += " " + partialText.value
+                    }
+                    partialText.value = ""
+                }
+                
+                // Update UI to show recognition has stopped
+                waitingForSpeech = false
+                isListening.value = false
+                
+                // Only show toast for errors other than NO_MATCH (which is too common)
+                if (error != SpeechRecognizer.ERROR_NO_MATCH) {
                     val errorMessage = when (error) {
                         SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
                         SpeechRecognizer.ERROR_CLIENT -> "Client side error"
@@ -187,12 +198,9 @@ class MainActivity : ComponentActivity() {
                     partialText.value = ""
                 }
                 
-                // The recognizer has stopped after getting results
-                // Update UI state to reflect this
+                // SpeechRecognizer stops after delivering results
+                // Update UI to reflect this
                 isListening.value = false
-                
-                // Note: To continue listening after getting results, you would need to 
-                // call startListening() again but without clearing the text
             }
             
             override fun onPartialResults(partialResults: Bundle?) {
@@ -234,10 +242,11 @@ class MainActivity : ComponentActivity() {
                 putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, true)
             }
             
-            // Set silence timeout to exactly 5 seconds
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1000)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 5000)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 5000)
+            // Don't use any timeouts - let the user take as long as needed to start speaking
+            // These are max values to prevent the recognizer from timing out
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 0)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000000) // Very long
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000000) // Very long
             
             // Multiple results for better accuracy
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
@@ -249,6 +258,9 @@ class MainActivity : ComponentActivity() {
         recognizedText.value = ""
         partialText.value = ""
         isListening.value = true
+        lastStartTime = System.currentTimeMillis()
+        waitingForSpeech = true
+        lastErrors.clear()
         
         val recognizerIntent = createRecognizerIntent()
         
@@ -257,6 +269,7 @@ class MainActivity : ComponentActivity() {
             Log.d(TAG, "Started listening with language: ${selectedLanguage.value}")
         } catch (e: Exception) {
             isListening.value = false
+            waitingForSpeech = false
             Log.e(TAG, "Error starting recognition: ${e.message}")
             Toast.makeText(this, "Error starting recognition: ${e.message}", Toast.LENGTH_SHORT).show()
         }
